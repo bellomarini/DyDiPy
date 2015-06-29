@@ -21,266 +21,346 @@ USA
 
 """
 This file contains the port of the datalog engine of J. D. Ramsdell, 
-from lua to python, with some enhancements:
-* indexing of facts,
-* support for lambda.
+from lua to python, with many enhancements.
 
-Some differences between python and lua:
-* lua indices start at 1, not 0
-* any variable is true in lua if it is not nil or false.
-* lua tables contain both a list and a dictionary --> need to change them to objects
-* lua variables are global by default, python ones are local by default
-* variable bindings in a closure.  See http://tiny.cc/7837cw, http://tiny.cc/rq47cw
+See also doc.py for additional source code documentation.
 """
-from collections import deque
-import copy
+
+from collections import deque, OrderedDict
 import gc
-from itertools import groupby
+import logging
 import re
-import six
-from six.moves import xrange
+import threading
 import weakref
 
-pyDatalog = None #circ: later set by pyDatalog to avoid circular import
+from . import util
 
-Trace = False # True --> show new facts when they are established
-Debug = False # for deeper traces
+Logging = False # True --> logging is activated.  Kept for performance reason
 Auto_print = False # True => automatically prints the result of a query
+Slow_motion = False # True => detail print of the stack of tasks at each step
 
 Python_resolvers = {} # dictionary  of python functions that can resolve a predicate
+Logic = None # place holder for Logic class from Logic module
 
-# DATA TYPES
-
-# Internalize objects based on an identifier.
-
-# To make comparisons between items of the same type efficient, each
-# item is internalized so there is at most one of them associated
-# with an identifier.  An identifier is always a string.
-
-# For example, after internalization, there is one constant for each
-# string used to name a constant.
+# Keep a dictionary of classes with datalog capabilities.  
+Class_dict = {}
 
 
-class Interned(object):
-    # beware, they should be one registry per class --> copy the following line in the child class !!
-    # registry = weakref.WeakValueDictionary()
-    @classmethod
-    def of(cls, atom):
-        if isinstance(atom, (Interned, Fresh_var)):
-            return atom
-        elif isinstance(atom, (list, tuple, xrange)):
-            return VarTuple(tuple([Interned.of(element) for element in atom]))
-        else:
-            return Const(atom)
-    notFound = object()
-    def __eq__(self, other):
-        return self is other
-    def __hash__(self): return id(self)
-    def __ne__(self, other):
-        return not self is other
-    def is_const(self): # for backward compatibility with custom resolvers
-        return self.is_constant
+#       DATA TYPES          #####################################
 
-# A term is either a variable or a constant.
+def Term_of(atom):
+    """ factory function for Term """
+    if isinstance(atom, Term):
+        return atom
+    elif isinstance(atom, (list, tuple, util.xrange)):
+        return VarTuple(tuple(map(Term_of, atom)))
+    else:
+        return Const(atom)
 
-# Variables as simple objects.
 
-def add_size(s):
-    return "%i:%s" % (len(s), s)
+class Term(object):
+    # needed for Cython
+    pass
 
-class Fresh_var(object): # no interning needed
-    fresh_var_state = 0  
+
+class Fresh_var(Term):
+    """ a variable created by the search algorithm """
+    __slots__ = ['id']
+    tl = threading.local()
     def __init__(self):
-        self.id = str(Fresh_var.fresh_var_state)
-        self.key = add_size('v' + self.id)
-        Fresh_var.fresh_var_state += 1 # ensures freshness
+        Fresh_var.tl.counter = Fresh_var.tl.counter +1
+        self.id = ('f', Fresh_var.tl.counter) #id
     
     def is_const(self):
         return False
-    is_constant = False
-    def get_tag(self, env):
-        env.setdefault(self, 'v%i' % len(env)) # TODO return the result of this statement directly ?
-        return env[self] 
+    def get_tag(self, env): #id
+        return env.setdefault(self.id, ('v', len(env)))
 
-    def subst(self, env):
-        return env.get(self, self)
-    def shuffle(self, env):
-        env.setdefault(self, Fresh_var())
-        return env[self] #TODO no need to return a value
-    def chase(self, env):
-        return env[self].chase(env) if self in env else self
+    def subst(self, env): #unify
+        return env.get(self.id, self)
+    def shuffle(self, env): #shuffle
+        return env.setdefault(self.id, Fresh_var())
+    def chase(self, env): #unify
+        # try ... except is not faster
+        return env[self.id].chase(env) if self.id in env else self
+    
+    def match(self, constant, env):
+        if self.id not in env:
+            env[self.id] = constant
+            return env
+        elif env[self.id] == constant: # dead code ?
+            return env
+        else: # dead code ?
+            return None
     
     def unify(self, term, env):
-        return term.unify_var(self, env)
-    def unify_const(self, const, env):
-        env[self] = const
-        return env
-    def unify_var(self, var, env):
-        env[var] = self
-        return env
-    def unify_tuple(self, tuple, env):
-        env[self] = tuple
-        return env
-    
-    def is_safe(self, clause):
-        return any(is_in(self, bodi) for bodi in clause.body)
+        if isinstance(term, Fresh_var):
+            env[term.id] = self
+            return env
+        if isinstance(term, (Const, VarTuple)):
+            env[self.id] = term
+            return env
+        if isinstance(term, Operation):
+            return None
+
     def __str__(self): 
-        return "variable_%s" % self.id
+        return "variable_%s" % self.id[1]
     def equals_primitive(self, term, subgoal):
+        """ by default, self==term fails """
         return None
 
-class Var(Fresh_var, Interned):
-    registry = weakref.WeakValueDictionary()
-    def __new__(cls,  _id):
-        o = cls.registry.get(_id, Interned.notFound)
-        if o is Interned.notFound:
-            o = object.__new__(cls) # o is the ref that keeps it alive
-            o.id = _id
-            o.key = add_size('v' + _id)
-            cls.registry[_id] = o
-        return o
+
+class Var(Fresh_var):
+    """ A variable in a clause or query """
+    __slots__ = ['id']
     def __init__(self, name):
-        pass
-    def is_in(self, other):
-        if isinstance(other, Var):
-            return self==other
-        if isinstance(other, VarTuple):
-            return any(self.is_in(element) for element in other._id)
+        self.id = ('f', name) #id
+
     def __str__(self): 
-        return self.id 
+        return self.id[1]
 
-# Constants as simple objects.
+    def unify(self, term, env):
+        return Fresh_var.unify(self, term, env)
 
-class Const(Interned):
-    registry = weakref.WeakValueDictionary()
-    def __new__(cls,  _id):
-        o = cls.registry.get(_id, Interned.notFound)
-        if o is Interned.notFound: 
-            o = object.__new__(cls) # o is the ref that keeps it alive
-            o.id = _id
-            o.key = add_size( 'c' + str(o.id) if isinstance(o.id, (six.string_types, int)) 
-                    else 'o' + str(id(o)) )
-            cls.registry[_id] = o
-        return o
-    is_constant = True
-    def get_tag(self, env):
-        return self.key
-    def subst(self, env):
+
+class Const(Term):
+    """ a constant """
+    __slots__ = ['id']
+
+    def __init__(self, _id):
+        self.id = _id
+    
+    def is_const(self): # for backward compatibility with custom resolvers
+        return True
+
+    def get_tag(self, env): #id
+        return self.id
+    
+    def subst(self, env): #unify
         return self
-    def shuffle(self, env):
-        return None  #TODO no need to return a value
-    def chase(self, env):
+    def shuffle(self, env): #shuffle
         return self
+    def chase(self, env): #unify
+        return self
+    
+    def match(self, constant, env):
+        return None
     
     def unify(self, term, env):
-        return term.unify_const(self, env)
-    def unify_const(self, const, env):
+        if isinstance(term, Fresh_var):
+            env[term.id] = self
+            return env
         return None
-    def unify_var(self, var, env):
-        return var.unify_const(self, env)
-    def unify_tuple(self, tuple, env):
-        return None
-    
-    def is_safe(self, clause): 
-        return True
-    
+
     def __str__(self): 
         return "'%s'" % self.id
     def equals_primitive(self, term, subgoal):
-        if self == term:          # Both terms are constant and equal.
-            literal = Literal(binary_equals_pred, (self, self))
-            return fact(subgoal, literal)
+        if self.id == term.id:          # Both terms are constant and equal.
+            literal = Literal("==", [self, self])
+            return subgoal.fact(literal)
 
-class VarTuple(Interned):
-    registry = weakref.WeakValueDictionary()
-    def __new__(cls,  _id):
-        o = cls.registry.get(_id, Interned.notFound)
-        if o is Interned.notFound: 
-            o = object.__new__(cls) # o is the ref that keeps it alive
-            o._id = _id
-            #o.key = add_size('o' + str(id(o)) )
-            o.key = '('+ ''.join([e.key for e in _id]) + ')'
-            o.id = tuple([element.id for element in _id])
-            o.is_constant = all(element.is_constant for element in _id)
-            cls.registry[_id] = o
-        return o
-    
+
+class VarTuple(Term):
+    """ a tuple / list of variables, constants or tuples """
+    __slots__ = ['_id', 'id', 'is_constant']
+
+    def __init__(self, _id): # _id is a list of Term
+        self._id = _id
+        self.id =  tuple(e.id for e in _id) #id
+        self.is_constant = all(element.is_const() for element in _id)
+
+    def is_const(self): # for backward compatibility with custom resolvers
+        return self.is_constant
+
     def __len__(self):
-        return len(self._id)        
+        return len(self._id)
     
-    def get_tag(self, env):
+    def get_tag(self, env): #id
         if self.is_constant: # can use lazy property only for constants
-            return self.key
-        return repr([t.get_tag(env) for t in self._id])#TODO
-    def subst(self, env):
+            return self.id
+        #Cython version for : return tuple(t.get_tag(env) for t in self._id) #id
+        result = []
+        for t in self._id:
+            result.append(t.get_tag(env))
+        return tuple(result)
+    
+    def subst(self, env): #unify
         if self.is_constant: # can use lazy property only for constants
             return self
-        return VarTuple(tuple([element.subst(env) for element in self._id]))
-    def shuffle(self, env):
-        if not self.is_constant:
-            for element in self._id:
-                element.shuffle(env)
-    def chase(self, env):
+        #Cython version for : return VarTuple(tuple(element.subst(env) for element in self._id))
+        result = []
+        for t in self._id:
+            result.append(t.subst(env))
+        return VarTuple(result)
+
+    def shuffle(self, env): #shuffle
         if self.is_constant:
             return self
-        return VarTuple(tuple([element.chase(env) for element in self._id]))
+        else:
+            result = []
+            for element in self._id:
+                result.append(element.shuffle(env))
+            return VarTuple(result)
+    def chase(self, env): #unify
+        if self.is_constant:
+            return self
+        #Cython version for : return VarTuple(tuple(element.chase(env) for element in self._id))
+        result = []
+        for t in self._id:
+            result.append(t.chase(env))
+        return VarTuple(result)
     
-    def unify(self, term, env):
-        return term.unify_tuple(self, env)
-    def unify_const(self, const, env):
-        return None
-    def unify_var(self, var, env):
-        return var.unify_tuple(self, env)
-    def unify_tuple(self, tuple, env):
-        if len(self) != len(tuple):
-            return None
-        for e1, e2 in zip(self._id, tuple._id):
-            if e1 != e2:
-                env = e1.unify(e2, env)
-                if env == None: return env
-        return env
+    # def match is not needed here
 
-    def is_safe(self, clause): 
-        return all(element.is_safe(clause) for element in self._id)
+    def unify(self, term, env):
+        if isinstance(term, Fresh_var):
+            env[term.id] = self
+            return env
+        if isinstance(term, Const):
+            return None
+        if isinstance(term, VarTuple):
+            if len(self._id) != len(term._id):
+                return None
+            for e1, e2 in zip(term._id, self._id):
+                if e1.id != e2.id:
+                    env = e1.unify(e2, env)
+                    if env == None: return env
+            return env
+        if isinstance(term, Operation):
+            return None
 
     def __str__(self): 
         return "'%s'" % str([str(e) for e in self.id])
     def equals_primitive(self, term, subgoal):
-        if self == term:          # Both terms are constant and equal.
-            literal = Literal(binary_equals_pred, (self, self))
-            return fact(subgoal, literal)
+        if self.id == term.id:          # Both terms are constant and equal.
+            literal = Literal("==", [self, self])
+            return subgoal.fact(literal)
 
-# Predicate symbols
 
-# A predicate symbol has a name, an arity, and a database table.  It
-# can also have a function used to implement a primitive.
+class Operation(Term):
+    """ an arithmetic operation, a slice or a lambda """
+    counter = util.Counter()
+    def __init__(self, lhs, operator, rhs):
+        self.operator = operator
+        self.operator_id = 'l' + str(Operation.counter.next()) if isinstance(self.operator, type(util.LAMBDA)) else str(self.operator)
+        self.lhs = lhs
+        self.rhs = rhs
+        self.is_constant = False
+        self.id = (self.lhs.id, self.operator_id, self.rhs.id) #id
+    
+    def is_const(self): # for backward compatibility with custom resolvers
+        return False
+    
+    def get_tag(self, env): #id
+        return (self.lhs.get_tag(env), self.operator_id, self.rhs.get_tag(env))
+    
+    def subst(self, env): #unify
+        lhs = self.lhs.subst(env)
+        rhs = self.rhs.subst(env)
+        try:
+            if self.operator == '[' and isinstance(lhs, (VarTuple, Const)) and rhs.is_const():
+                v = lhs._id if isinstance(lhs, VarTuple) else lhs.id
+                if isinstance(rhs, VarTuple): # a slice
+                    return Term_of(v.__getitem__(slice(*rhs.id)))
+                return Term_of(v.__getitem__(rhs.id))
+            if self.operator == '#' and isinstance(rhs, VarTuple):
+                return Term_of(len(rhs))
+            if self.operator == '..' and rhs.is_const():
+                return Term_of(range(rhs.id))
+            if lhs.is_const() and rhs.is_const():
+                # calculate expression of constants
+                if self.operator == '+':
+                    return Term_of(lhs.id + rhs.id)
+                elif self.operator == '-':
+                    return Term_of(lhs.id - rhs.id)
+                elif self.operator == '*':
+                    return Term_of(lhs.id * rhs.id)
+                elif self.operator == '/':
+                    return Term_of(lhs.id / rhs.id)
+                elif self.operator == '//':
+                    return Term_of(lhs.id // rhs.id)
+                elif self.operator == '**':
+                    return Term_of(lhs.id ** rhs.id)
+                elif self.operator == '%':
+                    return Term_of(lhs.id.format(*(rhs.id)))
+                elif isinstance(self.operator, type(util.LAMBDA)):
+                    return Term_of(self.operator(*(rhs.id)))
+                elif self.operator == '.':
+                    v = lhs.id
+                    for attribute in rhs.id.split(".") :
+                        v = getattr(v, attribute)
+                    return Term_of(v)
+                elif self.operator == '(':
+                    return Term_of(lhs.id.__call__(*(rhs.id)))
+                assert False # dead code
+            return Operation(lhs, self.operator, rhs)
+        except Exception as e:
+            return Term_of(e)
+            
+    def shuffle(self, env): #shuffle
+        return Operation(self.lhs.shuffle(env), self.operator, self.rhs.shuffle(env))
+
+    def chase(self, env): #unify
+        return Operation(self.lhs.chase(env), self.operator, self.rhs.chase(env))
+    
+    def unify(self, term, env):
+        return None
+        
+    def __str__(self): 
+        return "(%s%s%s)" % (str(self.lhs), str(self.operator), str(self.rhs))
+
+
+class Interned(object):
+    """ Abstract class for objects having only one instance in memory """
+    notFound = object()
+    def __eq__(self, other):
+        return self is other
+    def __hash__(self): 
+        return id(self)
+    def __ne__(self, other):
+        return not self is other
+
 
 class Pred(Interned):
-    registry = weakref.WeakValueDictionary()
-    def __new__(cls, pred_name, arity, aggregate=None):
-        assert isinstance(pred_name, six.string_types)
+    """ A predicate symbol has a name, an arity, and a database table.  
+        It can also have a function used to implement a primitive."""
+    lock = threading.RLock()
+    def __new__(cls, pred_name, arity):
+        assert isinstance(pred_name, util.string_types)
         _id = '%s/%i' % (pred_name, arity)
-        o = cls.registry.get(_id, Interned.notFound)
-        if o is Interned.notFound: 
-            o = object.__new__(cls) # o is the ref that keeps it alive
-            o.id = _id
-            o.name = pred_name
-            o.arity = arity
-            o.prearity = None
-            words = o.name.split('.')
-            o.prefix, o.suffix = (words[0], words[1].split('[')[0]) if 1 < len(words) else ('','')
-            words = pred_name.split(']')
-            o.comparison = words[1] if 1 < len(words) else '' # for f[X]<Y
-
-            o.db = {}
-            o.clauses = set([])
-            # one index per term. An index is a dictionary of sets
-            o.index = [{} for i in range(int(o.arity))]
-            o.prim = None
-            o.expression = None
-            o.aggregate = aggregate
-            cls.registry[_id] = o
+        with Pred.lock:
+            o = Logic.tl.logic.Pred_registry.get(_id, Interned.notFound)
+            if o is Interned.notFound: 
+                o = object.__new__(cls) # o is the ref that keeps it alive
+                o.id = _id
+                o.name = pred_name
+                o.arity = arity
+                o.prearity = None
+                words = o.name.split('.')
+                o.prefix, o.suffix = (words[0], words[1].split('[')[0]) if 1 < len(words) else ('','')
+                words = pred_name.split(']')
+                o.comparison = words[1] if 1 < len(words) else '' # for f[X]<Y
+    
+                o.db = OrderedDict()
+                o.clauses = OrderedDict()
+                # one index per term. An index is a dictionary of sets
+                o.index = [{} for i in range(int(o.arity))]
+                o.prim = None
+                o.expression = None
+                o.recursive = False
+                Logic.tl.logic.Pred_registry[_id] = o
         return o
+    
+    @classmethod
+    def is_known(cls, pred_id):
+        #TODO look at _pyD_ methods in classes, to detect more
+        prefix = pred_id.split('.')[0] # we assumes it has a '.'
+        if prefix in Class_dict:
+            for cls in Class_dict[prefix].__mro__:
+                rebased = pred_id.replace(prefix, cls.__name__, 1) # only the first occurrence
+                if rebased in Logic.tl.logic.Db:
+                    return True
+        return False        
     
     def _class(self):
         """determine the python class for a prefixed predicate (and caches it)"""
@@ -289,259 +369,285 @@ class Pred(Interned):
             self._cls = Class_dict.get(self.prefix, '') if self.prefix else None
         return self._cls
     
+    def parent_classes(self):
+        " iterator of the parent classes that have pyDatalog capabilities"
+        if self._class():
+            for cls in self._cls.__mro__:
+                if cls.__name__ in Class_dict and cls.__name__ not in ('Mixin', 'object'):
+                    yield cls
+        else:
+            yield None
+    
     def reset_clauses(self):
-        for clause in list(self.clauses):
+        """ clears the database of clauses for the predicate """
+        for clause in self.clauses.values():
             retract(clause)
     
-    def __str__(self): return "%s()" % self.name
+    def __str__(self): 
+        return "%s()" % self.name
 
-# Literals
-
-# A literal is a predicate and a sequence of terms, the number of
-# which must match the predicate's arity.
 
 class Literal(object):
+    """ A literal is a predicate and a sequence of terms, 
+        the number of which must match the predicate's arity.
+    """
+    __slots__ = ['terms', 'pred', 'id', 'tag', 'aggregate']
     def __init__(self, pred, terms, prearity=None, aggregate=None):
         self.terms = terms
-        if isinstance(pred, six.string_types):
-            self.pred = Pred(pred, len(terms), aggregate)
-            if pred[:1] == '~':
+        self.aggregate = aggregate
+        self.id, self.tag = None, None
+        if isinstance(pred, util.string_types):
+            self.pred = Pred(pred, len(terms))
+            self.pred.prearity = len(terms) if prearity is None else prearity
+            if pred.startswith('~'): #pred
                 self.pred.base_pred = Pred(pred[1:], len(terms))
+                self.pred.base_pred.prearity = self.pred.prearity
         else:
             self.pred = pred
             # TODO assert self.pred.prearity == (prearity or len(terms)), "Error: Incorrect mix of predicates and functions : %s" % str(self)
-        self.pred.prearity = prearity or len(terms)
     
     def _renamed(self, new_name):
         _id = '%s/%i' % (new_name, len(self.terms))
-        pred= Pred.registry.get(_id, new_name)
-        new = Literal(pred, list(self.terms), prearity=self.pred.prearity)
-        return new
+        pred= Logic.tl.logic.Pred_registry.get(_id, new_name)
+        return Literal(pred, list(self.terms), prearity=self.pred.prearity, aggregate=self.aggregate)
         
-    def rebased(self, parent_class): # returns a literal prefixed by parent class
+    def rebased(self, parent_class): 
+        """ returns a literal prefixed by parent class """
         pred = self.pred
         if not parent_class or not pred._class() or parent_class == pred._class(): 
             return self
         return self._renamed(re.sub('^((~)?)'+pred._class().__name__+'.', r'\1'+parent_class.__name__+'.', pred.name))
     
-    def equalized(self): # returns a new literal with '==' instead of comparison
+    def equalized(self): 
+        """ returns a new literal with '==' instead of comparison """
         return self._renamed(self.pred.name.replace(self.pred.comparison, '=='))
     
-    def __str__(self): return "%s(%s)" % (self.pred.name, ','.join([str(term) for term in self.terms])) 
+    def subst_first(self, env): #prefixed
+        """ substitute the first term of prefixed literal, using env """
+        if self.pred.prefix:
+            self.terms[0] = self.terms[0].subst(env)
+                
+    def __str__(self):
+        return "%s(%s)" % (self.pred.name, ','.join([str(term).replace("'_pyD_class'", '*') for term in self.terms])) 
 
-# A literal's id is computed on demand, but then cached.  It is used
-# by a clause when creating its id.
+    def get_id(self): #id
+        """ The id's encoding ensures that two literals are structurally the
+            same if they have the same id.  """
+        if not self.id: # cached
+            #Cython for : self.id = (self.pred.id,) + tuple(term.id for term in self.terms)
+            result = [self.pred.id,]
+            for term in self.terms:
+                result.append(term.id)
+            self.id = tuple(result)
+        return self.id        
 
-# The id's encoding ensures that two literals are structurally the
-# same if they have the same id.
+    def get_fact_id(self): #id
+        """ The id of a known fact is limited by its prearity
+            Prearity is used to ensure unicity of results of functions like pred[2]==1 """
+        return self.get_id()[:1+self.pred.prearity]
 
-def get_id(literal):
-    if not hasattr(literal, 'id'):
-        literal.id = add_size(literal.pred.id) + ''.join([term.key for term in literal.terms])
-    return literal.id
+    def get_tag(self): #id
+        """ the tag is used as a key by the subgoal table """
+        if not self.tag: # cached
+            env = {}
+            #Cython equivalent for : self.tag = (self.pred.id,) + tuple(term.get_tag(env) for term in self.terms)
+            result = [self.pred.id,]
+            for term in self.terms:
+                result.append(term.get_tag(env))
+            self.tag = tuple(result)
+        return self.tag       
 
-# A literal's key is similar to get_id, but only uses the terms up to the prearity. 
-# It is used to ensure unicity of results of functions like "pred[k]=v"
+    def subst(self, env): #unify
+        if not env: return self
+        #Cython equivalent for : return Literal(self.pred, [term.subst(env) for term in self.terms], aggregate=self.aggregate)
+        result = []
+        for term in self.terms:
+            result.append(term if isinstance(term, Const) else term.subst(env))    
+        return Literal(self.pred, result, aggregate=self.aggregate)
 
-def get_key(literal):
-    if not hasattr(literal, 'key'):
-        terms = literal.terms
-        if literal.pred.prearity and len(terms) == literal.pred.prearity:
-            literal.key = get_id(literal)
-        else:
-            literal.key = add_size(literal.pred.id) + ''.join([terms[i].key for i in range(literal.pred.prearity or len(terms))])
-    return literal.key
-    
-# Variant tag
+    def shuffle(self, env): #shuffle
+        result = []
+        for term in self.terms:
+            result.append(term if isinstance(term, Const) else term.shuffle(env))
+        return Literal(self.pred, result, aggregate=self.aggregate)
 
-# Two literal's variant tags are the same if there is a one-to-one
-# mapping of variables to variables, such that when the mapping is
-# applied to one literal, the result is a literal that is the same as
-# the other one, when compared using structural equality.  The
-# variant tag is used as a key by the subgoal table.
-
-def get_tag(literal):
-    if not hasattr(literal, 'tag'):
-        literal.tag = add_size(literal.pred.id)
+    def unify(self, other): #unify
+        if self.pred != other.pred: return None
         env = {}
-        literal.tag += ''.join([add_size(term.get_tag(env)) for term in literal.terms])
-    return literal.tag
-     
-# An environment is a map from variables to terms.
+        for term, otherterm in zip(self.terms, other.terms):
+            literal_i = term if isinstance(term, Const) else term.chase(env)
+            other_i = otherterm if isinstance(otherterm, Const) else otherterm.chase(env)
+            if literal_i.id != other_i.id:
+                env = literal_i.unify(other_i, env)
+                if env == None: return env
+        todo = True
+        while todo:
+            todo = False
+            for key, value in env.items(): # 2nd pass for issue #14
+                if not isinstance(value, Const):
+                    new_value = value.chase(env)
+                    if env[key].id != new_value.id:
+                        env[key]= new_value
+                        todo = True
+        return env
 
-def subst(literal, env):
-    if len(env) == 0: return literal
-    return Literal(literal.pred, [term.subst(env) for term in literal.terms])
+    def match(self, fact):
+        """ Does a fact unify with a fact known to contain only constant terms? """
+        env = {}
+        for term, factterm in zip(self.terms, fact.terms):
+            if term.id != factterm.id:
+                env = term.match(factterm, env)
+                if env == None: return env
+        return env
 
-# Shuffle creates an environment in which all variables are mapped to
-# freshly generated variables.
-
-def shuffle(literal, env):
-    for term in literal.terms:
-        term.shuffle(env)
-    return env
-
-# Renames a literal using an environment generated by shuffle.
-
-def rename(literal):
-    return subst(literal, shuffle(literal, {}))
-
-# Unify two literals.  The result is either an environment or nil.
-# Nil is returned when the two literals cannot be unified.  When they
-# can, applying the substitutions defined by the environment on both
-# literals will create two literals that are structurally equal.
-
-def unify(literal, other):
-    if literal.pred != other.pred: return None
-    env = {}
-    for term, otherterm in zip(literal.terms, other.terms):
-        literal_i = term.chase(env)
-        other_i = otherterm.chase(env)
-        if literal_i != other_i:
-            env = literal_i.unify(other_i, env)
-            if env == None: return env
-    return env
-
-
-# Does a literal have a given term?  Internalizing terms ensures an
-# efficient implementation of this operation.
-
-def is_in(term, literal):
-    return any(term.is_in(term2) for term2 in literal.terms)
-
-# These methods are used to handle a set of facts.
-def is_member(literal, tbl):
-    return tbl.get(get_key(literal))
-
-def adjoin(literal, tbl):
-    tbl[get_key(literal)] = literal
+    def ask(self):
+        """ Invoke the tasks. Each task may append new tasks on the schedule."""
+        Ts = Logic.tl.logic
+        saved_environment = Ts.Tasks, Ts.Recursive_Tasks, Ts.Recursive, Ts.Subgoals, Ts.Goal
+        Ts.Tasks, Ts.Recursive_Tasks, Ts.Subgoals, Ts.Goal = list(), deque(), {}, Subgoal(self)
+        Ts.gc_uncollected, Ts.Recursive = True, False
+        todo, arg = (SEARCH, (Ts.Goal, ))
+        while todo:
+            todo, arg = todo(*arg)
     
-# Clauses
+        if Ts.Goal.facts is True:
+            return True
+        result = [ tuple(term.id for term in literal.terms) for literal in list(Ts.Goal.facts.values())]
+        Ts.Tasks, Ts.Recursive_Tasks, Ts.Recursive, Ts.Subgoals, Ts.Goal = saved_environment
+        return result    
 
-# A clause has a head literal, and a sequence of literals that form
-# its body.  If there are no literals in its body, the clause is
-# called a fact.  If there is at least one literal in its body, it is
-# called a rule.
-
-# A clause asserts that its head is true if every literal in its body is
-# true.
 
 class Clause(object):
+    """ A clause asserts that its head is true if every literal in its body is
+        true.  If there are no literals in the body, the clause is a fact
+    """
+    __slots__ = ['head', 'body', 'id']
+
     def __init__(self, head, body):
         self.head = head
         self.body = body
+        self.id = None
     def __str__(self):  
-        return "%s <= %s" % (str(self.head), '&'.join([str(literal) for literal in self.body]))
+        return "%s <= %s" % (str(self.head), '&'.join(str(literal) for literal in self.body))
+    def __repr__(self):  
+        return ("%s <= %s" % (str(self.head), '&'.join(str(literal) for literal in self.body)))[:50]
     def __neg__(self):
         """retract clause"""
         retract(self) 
 
-# A clause's id is computed on demand, but then cached.
-
-# The id's encoding ensures that two clauses are structurally equal
-# if they have the same id.  A clause's id is used as a key into the
-# clause database.
-
-def get_clause_id(clause):
-    if not hasattr(clause, 'id'):
-        clause.id = add_size(get_key(clause.head)) + ''.join([add_size(get_key(bodi)) for bodi in clause.body])
-    return clause.id
+    def get_id(self): #id
+        """ The id's encoding ensures that two clauses are structurally equal
+            if they have the same id.  A clause's id is used as a key into the
+            clause database. """
+        if self.id is None: # cached
+            if not self.body: #if it is a fact
+                self.id = (self.head.get_fact_id(),)
+            else:
+                self.id = (self.head.get_id(),) + tuple(bodi.get_id() for bodi in self.body)
+        return self.id
     
-# Clause substitution in which the substitution is applied to each
-# literal that makes up the clause.
-
-def subst_in_clause(clause, env, parent_class=None):
-    if len(env) == 0 and not parent_class: return clause
-    return Clause(subst(clause.head, env).rebased(parent_class),
-                       [subst(bodi, env).rebased(parent_class) for bodi in clause.body])
+    def subst(self, env, parent_class=None):
+        """ apply the env mapping and rebase to parent_class, if any """
+        if not env and not parent_class: return self
+        if not parent_class:
+            return Clause(self.head.subst(env),
+                           [bodi.subst(env) for bodi in self.body])
+        return Clause(self.head.subst(env).rebased(parent_class),
+                        [bodi.subst(env).rebased(parent_class) for bodi in self.body])
     
-# Renames the variables in a clause.  Every variable in the head is
-# in the body, so the head can be ignored while generating an
-# environment.
+    def rename(self):
+        """ returns the clause with fresh variables """
+        env = {}
+        return Clause(self.head.shuffle(env),
+                           [bodi.shuffle(env) for bodi in self.body])
 
-def rename_clause(clause):
-    env = {}
-    for bodi in clause.body:
-        env = shuffle(bodi, env)
-    if len(env) == 0: return clause
-    return subst_in_clause(clause, env)
 
-# A clause is safe if every variable in its head is in its body.
+def add_class(cls, name):
+    """ Update the list of pyDatalog-capable classes, and update clauses accordingly"""
+    # this is needed because class definition could occur after clause definition
+    Class_dict[name] = cls
+    #prefixed replace the first term of each functional comparison literal for that class..
+    env = {Var(name).id: Const('_pyD_class')}
+    for pred in Logic.tl.logic.Db.values():
+        for clause in pred.db.values():
+            clause.head.subst_first(env)
+            for literal in clause.body:
+                literal.subst_first(env)
 
-def is_safe(clause):
-    return all(term.is_safe(clause) for term in clause.head.terms)
 
-# DATABASE
+# DATABASE  #####################################################
 
-# The database stores predicates that contain clauses.  Predicates
-# not in the database are subject to garbage collection.
+# The database stores predicates that contain clauses.  
 
-db = {}
 def insert(pred):
-    global db
-    db[pred.id] = pred
+    Logic.tl.logic.Db[pred.id] = pred
     return pred
 
 def remove(pred):
-    global db
-    if pred.id in db : del db[pred.id]
+    if pred.id in Logic.tl.logic.Pred_registry:
+        del Logic.tl.logic.Pred_registry[pred.id]
+    if pred.id in Logic.tl.logic.Db: 
+        del Logic.tl.logic.Db[pred.id]
     return pred
     
-# Add a safe clause to the database.
-
 def assert_(clause):
-    if not is_safe(clause): return None  # An unsafe clause was detected.
+    """ Add a safe clause to the database """
     pred = clause.head.pred
+
     if not pred.prim:                   # Ignore assertions for primitives.
-        if pred.aggregate and get_clause_id(clause) in pred.db:
-            raise pyDatalog.DatalogError("Error: Duplicate definition of aggregate function.", None, None)
+        id_ = clause.get_id()
         retract(clause) # to ensure unicity of functions
-        pred.db[get_clause_id(clause)] = clause
-        if len(clause.body) == 0: # if it is a fact, update indexes
+        pred.db[id_] = clause
+        if not clause.body: # if it is a fact, update indexes
             for i, term in enumerate(clause.head.terms):
-                clauses = pred.index[i].setdefault(term, set([])) # create a set if needed
+                clauses = pred.index[i].setdefault(term.id, set()) # create a set if needed
                 clauses.add(clause)
         else:
-            pred.clauses.add(clause)
+            if any(literal.pred.id == pred.id for literal in clause.body):
+                pred.recursive = True
+            pred.clauses[id_] = clause
         insert(pred)
     return clause
 
 def retract(clause):
+    """ retract a clause from the database"""
     pred = clause.head.pred
-    id_ = get_clause_id(clause)
+    id_ = clause.get_id()
     
     if id_ in pred.db: 
-        if len(clause.body) == 0: # if it is a fact, update indexes
+        if not clause.body: # if it is a fact, update indexes
             clause = pred.db[id_] # make sure it is identical to the one in the index
             for i, term in enumerate(clause.head.terms):
-                pred.index[i][term].remove(clause)
+                pred.index[i][term.id].remove(clause)
                 # TODO del pred.index[i][term] if the set is empty
         else:
-            pred.clauses.remove(pred.db[id_])
+            del pred.clauses[id_]
         del pred.db[id_]  # remove clause from pred.db
-    """ TODO retract last fact removes pred ??  problem with assert function
-    if len(pred.db) == 0 and pred.prim == None: # if no definition left
+    # delete it completely if it's a temporary query predicate
+    if pred.name.startswith('_pyD_query') and len(pred.db) == 0 and pred.prim == None:
         remove(pred)
-    """
     return clause
-
+    
 def relevant_clauses(literal):
-    #returns matching clauses for a literal query, using index
+    """ returns matching clauses for a literal query, using index """
     result = None
     for i, term in enumerate(literal.terms):
-        if term.is_constant:
-            facts = literal.pred.index[i].get(term) or set({})
+        if term.is_const():
+            facts = literal.pred.index[i].get(term.id, set()) # default : a set
             result = facts if result == None else result.intersection(facts)
-    if result == None: # no constants found
-        return list(literal.pred.db.values())
+    if result == None: # no constants found in literal, thus could not filter literal.pred.deb
+        for v in literal.pred.db.values(): 
+            yield v
     else:
-        #result= [ literal.pred.db[id_] for id_ in result ] + [ literal.pred.db[id_] for id_ in literal.pred.clauses]
-        return list(result) + list(literal.pred.clauses)
+        for v in literal.pred.clauses.values(): 
+            yield v
+        for v in result: 
+            yield v
     
-# PROVER
+################# Subgoals ###############################
 
 """
-The remaining functions in this file implement the tabled logic
+The remaining functions in this file is based on the tabled logic
 programming algorithm described in "Efficient Top-Down Computation of
 Queries under the Well-Founded Semantics", Chen, W., Swift, T., and
 Warren, D. S., J. Logic Prog. Vol. 24, No. 3, pp. 161-199.  Another
@@ -550,336 +656,423 @@ Logic Programs", Chen, W., and Warren, D. S., J. ACM, Vol. 43, No. 1,
 Jan. 1996, pp. 20-74.
 
 It should be noted that a simplified version of the algorithm of 
-"Efficient top-down computation" is implemented : negations are not 
-supported. 
+"Efficient top-down computation" is implemented : negations are  
+supported with another algorithm. 
 """
 
-# The subgoal table is a map from the variant tag of a subgoal's
-# literal to a subgoal.
-
-subgoals = {}
-
-def find(literal):
-    tag = get_tag(literal)
-    return subgoals.get(tag)
-
-def merge(subgoal):
-    global subgoals
-    subgoals[get_tag(subgoal.literal)] = subgoal
-
-# A subgoal is the item that is tabled by this algorithm.
-
-# A subgoal has a literal, a set of facts, and an array of waiters.
-# A waiter is a pair containing a subgoal and a clause.
-
 class Subgoal(object):
+    """
+    A subgoal has a literal, a set of facts, and an array of waiters.
+    A waiter is a pair containing a subgoal and a clause.
+    """
+    __slots__ = ['literal', 'facts', 'waiters', 'tasks', 'clauses', 'recursive', 'is_done', 'on_completion_']
     def __init__(self, literal):
         self.literal = literal
         self.facts = {}
         self.waiters = []
-def make_subgoal(literal):
-    return Subgoal(literal)
+        self.recursive = literal.pred.recursive
+        self.tasks = deque() if self.recursive else list()
+        self.clauses = []
+        # subgoal is done when a partial literal is true 
+        # or when one fact is found for a function of constants
+        self.is_done = False
+        self.on_completion_ = []
     
-# Resolve the selected literal of a clause with a literal.  The
-# selected literal is the first literal in body of a rule.  If the
-# two literals unify, a new clause is generated that has a body with
-# one less literal.
-
-def resolve(clause, literal):
-    env = unify(clause.body[0], rename(literal))
-    if env == None: 
-        return None # dead code ?
-    return Clause(subst(clause.head, env), [subst(bodi, env) for bodi in clause.body[1:] ])
- 
-# A stack of thunks used to avoid the stack overflow problem
-# by delaying the evaluation of some functions
-
-Fast = None
-tasks = None
-Stack = []       
-
-# Schedule a task for later invocation
-
-class Thunk(object):
-    def __init__(self, thunk):
-        self.thunk = thunk
-    def do(self):
-        self.thunk()
-        
-def schedule(task):
-    global tasks
-    if Fast: return task.do()
-    return tasks.append(task)
-
-def complete(thunk, post_thunk):
-    """makes sure that thunk() is completed before calling post_thunk and resuming processing of other thunks"""
-    global Fast, subgoals, tasks, Stack
-    Stack.append((subgoals, tasks)) # save the environment to the stack. Invoke will eventually do the Stack.pop().
-    subgoals, tasks = {}, deque()
-    schedule(Thunk(thunk))
-    if Fast: 
-        #TODO pop to recover memory space
-        return post_thunk() # don't bother with thunks if Fast
-    # prepend post_thunk at one level lower in the Stack, 
-    # so that it is run immediately by invoke() after the search() thunk is complete
-    Stack[-1][1].appendleft(Thunk(post_thunk)) 
+    def __repr__(self):
+        return str(self.literal)
     
-# Invoke the tasks. Each task may append new tasks on the schedule.
-
-def invoke(thunk):
-    global tasks, subgoals
-    if Fast: return thunk()
-    tasks = deque([Thunk(thunk),])
-    while tasks or Stack:
-        while tasks:
-            tasks.popleft().do() # get the thunk and execute it
-        if Stack: 
-            subgoals, tasks = Stack.pop()
-            if Debug: print('pop')
-    tasks = None
-
-# dedicated objects give better performance than thunks 
-class Search(object):
-    def __init__(self, subgoal):
-        self.subgoal = subgoal
-    def do(self):
-        search(self.subgoal)
-
-class Add_clause(object):
-    def __init__(self, subgoal, clause):
-        self.subgoal = subgoal
-        self.clause = clause
-    def do(self):
-        add_clause(self.subgoal, self.clause)
-        
-# Store a fact, and inform all waiters of the fact too.
-
-def fact(subgoal, literal):
-    if not is_member(literal, subgoal.facts):
-        if Trace: print("New fact : %s" % str(literal))
-        adjoin(literal, subgoal.facts)
-        for waiter in reversed(subgoal.waiters):
-            resolvent = resolve(waiter.clause, literal)
-            if resolvent != None:
-                schedule(Add_clause(waiter.subgoal, resolvent))
-
-# Use a newly derived rule.
-
-class Waiter(object):
-    def __init__(self, subgoal, clause):
-        self.subgoal = subgoal
-        self.clause = clause
-        
-def rule(subgoal, clause, selected):
-    sg = find(selected)
-    if sg != None:
-        sg.waiters.append(Waiter(subgoal, clause))
-        todo = []
-        for fact in list(sg.facts.values()):
-            resolvent = resolve(clause, fact)
-            if resolvent != None: 
-                todo.append(resolvent)
-        for t in todo:
-            schedule(Add_clause(subgoal, t))
-    else:
-        sg = make_subgoal(selected)
-        sg.waiters.append(Waiter(subgoal, clause))
-        merge(sg)
-        return schedule(Search(sg))
-    
-def add_clause(subgoal, clause):
-    if len(clause.body) == 0:
-        return fact(subgoal, clause.head)
-    else:
-        return rule(subgoal, clause, clause.body[0])
-    
-# Search for derivations of the literal associated with this subgoal.
-
-def _(self):
-    " iterator of the parent classes that have pyDatalog capabilities"
-    if self._class():
-        for cls in self._cls.__mro__:
-            if cls.__name__ in Class_dict and cls not in (pyDatalog.Mixin, object):
-                yield cls
-    else:
-        yield None
-Pred.parent_classes = _
-
-def fact_candidate(subgoal, class0, result):
-    result = [Interned.of(r) for r in result]
-    if class0 and result[0].id and not isinstance(result[0].id, class0): 
-        return
-    result = Literal(subgoal.literal.pred.name, result)
-    env = unify(subgoal.literal, result)
-    if env != None:
-        fact(subgoal, result)
-
-def search(subgoal):
-    literal0 = subgoal.literal
-    class0 = literal0.pred._class()
-    terms = literal0.terms
-    
-    if class0 and terms[0].is_constant and terms[0].id is None: return
-    if hasattr(literal0.pred, 'base_pred'): # this is a negated literal
-        if Debug : print("pyDatalog will search negation of %s" % literal0)
+    def search(self):
         """ 
-        for term in terms:
-            if not term.is_const(): # all terms of a negated predicate must be bound
-                raise RuntimeError('Terms of a negated literal must be bound : %s' % str(literal0))
+        Search for derivations of the literal associated with this subgoal 
+        aka SLG_SUBGOAL in the reference article
         """
-        base_literal = Literal(literal0.pred.base_pred, terms)
-        """ the rest of the processing essentially performs the following, 
-        but in its own environment, and with precautions to avoid stack overflow :
-            result = ask(base_literal)
-            if result is None or 0 == len(result.answers):
-                return fact(subgoal, literal)
-        """
-        def _search(base_literal, subgoal, literal): # first-level thunk for ask(base_literal)
-            
-            #TODO check that literal is not one of the subgoals already in the stack, to prevent infinite loop
-            # example : p(X) <= ~q(X); q(X) <= ~ p(X); creates an infinite loop
-            
-            base_subgoal = make_subgoal(base_literal)
-
-            complete(lambda base_subgoal=base_subgoal: merge(base_subgoal) or search(base_subgoal),
-                     lambda base_subgoal=base_subgoal, subgoal=subgoal, literal=literal:
-                        # TODO deal with variable terms in result 
-                        fact(subgoal, literal) if 0 == len(list(base_subgoal.facts.values())) else None)
-                
-        schedule(Thunk(lambda base_literal=base_literal, subgoal=subgoal, literal=literal0: 
-                       _search(base_literal, subgoal, literal)))
-        return
-
-    assert not class0 or not terms[0].is_constant or isinstance(terms[0].id, class0), \
-        "TypeError: First argument of %s must be a %s, not a %s " % (str(literal0), class0.__name__, type(terms[0].id).__name__)
-    for _class in literal0.pred.parent_classes():
-        literal = literal0.rebased(_class)
-        method_name = '_pyD_%s%i'% (literal.pred.suffix, int(literal.pred.arity)) # TODO special method for comparison
+        literal0 = self.literal
+        class0 = literal0.pred._class()
+        terms = literal0.terms
         
-        if literal.pred.id in Python_resolvers:
-            if Debug : print("pyDatalog uses python resolvers for %s" % literal)
-            for result in Python_resolvers[literal.pred.id](*terms):
-                fact_candidate(subgoal, class0, result)
-            return
-        elif _class and literal.pred.suffix and method_name in _class.__dict__:
-            if Debug : print("pyDatalog uses class resolvers for %s" % literal)
-            for result in getattr(_class, method_name)(*terms):
-                fact_candidate(subgoal, class0, result)
-            return        
-        try: # call class._pyD_query
-            resolver = _class._pyD_query
-            if not _class.has_SQLAlchemy : gc.collect() # to make sure pyDatalog.metaMixin.__refs__[cls] is correct
-            for result in resolver(literal.pred.name, terms):
-                fact_candidate(subgoal, class0, result)
-            if Debug : print("pyDatalog has used _pyD_query resolvers for %s" % literal)
-            return
-        except:
-            pass
-        if literal.pred.prim: # X==Y, X < Y+Z
-            if Debug : print("pyDatalog uses comparison primitive for %s" % literal)
-            return literal.pred.prim(literal, subgoal)
-        elif literal.pred.aggregate:
-            if Debug : print("pyDatalog uses aggregate primitive for %s" % literal)
-            aggregate = literal.pred.aggregate
-            base_terms = list(terms)
-            del base_terms[-1]
-            base_terms.extend([ Var('V%i' % i) for i in range(aggregate.arity)])
-            base_literal = Literal(literal.pred.name + '!', base_terms)
+        if class0 and terms[1].is_const() and terms[1].id is None: return self.next_step()
+        if hasattr(literal0.pred, 'base_pred'): # this is a negated literal
+            if Logging: logging.debug("pyDatalog will search negation of %s" % literal0)
+            base_literal = Literal(literal0.pred.base_pred, terms)
+            self.complete(base_literal)
+            return self.next_step()
+        
+        for _class in literal0.pred.parent_classes():
+            literal = literal0.rebased(_class)
+            
+            if Python_resolvers:
+                resolver = literal.pred.id if literal.pred.id in Python_resolvers \
+                        else literal.pred.id.replace(r'/', str(literal.pred.arity)+r"/")
+                if resolver in Python_resolvers:
+                    if Logging : logging.debug("pyDatalog uses python resolvers for %s" % literal)
+                    for result in Python_resolvers[resolver](*terms):
+                        self.fact_candidate(class0, result)
+                    return self.next_step()
+            if _class: 
+                # TODO add special method for custom comparison
+                method_name = '_pyD_%s%i' % (literal.pred.suffix, int(literal.pred.arity - 1)) #prefixed
+                if literal.pred.suffix and method_name in _class.__dict__:
+                    if Logging : logging.debug("pyDatalog uses class resolvers for %s" % literal)
+                    for result in getattr(_class, method_name)(*(terms[1:])): 
+                        self.fact_candidate(class0, (terms[0],) + result)
+                    return self.next_step()
+                if '_pyD_query' in _class.__dict__:        
+                    try: # call class._pyD_query
+                        if Logic.tl.logic.gc_uncollected and not _class.has_SQLAlchemy: 
+                            gc.collect() # to make sure pyDatalog.metaMixin.__refs__[cls] is correct
+                            Logic.tl.logic.gc_uncollected = False
+                        results = list(_class._pyD_query(literal.pred.name, terms[1:]))
+                    except AttributeError:
+                        pass
+                    else:
+                        if Logging: logging.debug("pyDatalog uses _pyD_query resolvers for %s" % literal)
+                        for result in results:
+                            self.fact_candidate(class0, (terms[0],) + result)
+                        return self.next_step()
+            if literal.pred.prim: # X==Y, X < Y+Z
+                if Logging : logging.debug("pyDatalog uses comparison primitive for %s" % literal)
+                literal.pred.prim(literal, self)
+                return self.next_step()
+            elif literal.aggregate:
+                if Logging : logging.debug("pyDatalog uses aggregate primitive for %s" % literal)
+                base_terms = list(terms[:-1])
+                for i in literal.aggregate.slice_to_variabilize:
+                    base_terms[i] = Fresh_var()
+                base_literal = Literal(literal.pred.name, base_terms) # without aggregate to avoid infinite loop
+                self.complete(base_literal, literal.aggregate)
+                return self.next_step()
+            elif literal.pred.id in Logic.tl.logic.Db: # has a datalog definition, e.g. p(X), p[X]==Y
+                assert self.clauses == []
+                for clause in relevant_clauses(literal):
+                    renamed = clause.rename()
+                    env = literal.unify(renamed.head)
+                    if env != None:
+                        clause = renamed.subst(env, class0)
+                        if Logging : logging.debug("pyDatalog will use clause : %s" % clause)
+                        self.clauses.append((ADD_CLAUSE, (self, clause)))
+                if self.clauses:
+                    self.schedule((NEXT_CLAUSE, (self,)))
+                return self.next_step()
+            elif literal.pred.comparison: # p[X]<=Y => consider translating to (p[X]==Y1) & (Y1<Y)
+                literal1 = literal.equalized()
+                if literal1.pred.id in Logic.tl.logic.Db: # equality has a datalog definition
+                    Y1 = Fresh_var()
+                    literal1.terms[-1] = Y1
+                    literal2 = Literal(literal.pred.comparison, [Y1, terms[-1]])
+                    clause = Clause(literal, [literal1, literal2])
+                    renamed = clause.rename()
+                    env = literal.unify(renamed.head)
+                    if env != None:
+                        renamed = renamed.subst(env, class0)
+                        if Logging : logging.debug("pyDatalog will use clause for comparison: %s" % renamed)
+                        self.schedule((ADD_CLAUSE, (self, renamed)))
+                    return self.next_step()
+                
+        if class0: # a.p[X]==Y, a.p[X]<y, to access instance attributes
+            try: 
+                if Logic.tl.logic.gc_uncollected and not class0.has_SQLAlchemy: 
+                    gc.collect() # to make sure pyDatalog.metaMixin.__refs__[cls] is correct
+                    Logic.tl.logic.gc_uncollected = False
+                results = tuple(class0.pyDatalog_search(literal))
+            except AttributeError:
+                pass
+            else:
+                if Logging: logging.debug("pyDatalog uses pyDatalog_search for %s" % literal)
+                for result in results:
+                    self.fact_candidate(class0, result)
+                return self.next_step()
+        elif literal.pred.comparison and len(terms)==3 and terms[0].is_const() \
+        and terms[0].id != '_pyD_class' and terms[1].is_const(): # X.a[1]==Y
+            # do not use pyDatalog_search as the variable may not be in a pyDatalog class
+            v = getattr(terms[0].id, literal.pred.suffix)
+            if isinstance(terms[1], VarTuple): # a slice
+                v = v.__getitem__(slice(*terms[1].id))
+            else:
+                v = v.__getitem__(terms[1].id)
+            if terms[2].is_const() and compare(v, literal.pred.comparison, terms[2].id):
+                self.fact_candidate(class0, (terms[0], terms[1], terms[2]))
+            elif literal.pred.comparison == "==" and not terms[2].is_const():
+                self.fact_candidate(class0, (terms[0], terms[1], v))
+            else:
+                raise util.DatalogError("Error: right hand side of comparison must be bound: %s" 
+                                    % literal.pred.id, None, None)
+            return self.next_step()
     
-            #TODO thunking to avoid possible stack overflow
-            global Fast, subgoals, tasks, Stack
-            Stack.append((subgoals, tasks)) # save the environment to the stack. Invoke will eventually do the Stack.pop() when tasks is empty
-            subgoals, tasks = {}, deque()
-            #result = ask(base_literal)
-            base_subgoal = make_subgoal(base_literal)
-            merge(base_subgoal)
-            Fast = True # TODO why is it needed ??  Side effects !
-            search(base_subgoal)
-            Fast = False # TODO
-            result = [ tuple(l.terms) for l in list(base_subgoal.facts.values())]
-            
-            if result:
-                aggregate.sort_result(result)
-                for k, v in groupby(result, aggregate.key):
-                    aggregate.reset()
-                    for r in v:
-                        if aggregate.add(r):
-                            break
-                    k = aggregate.fact(k)
-                    fact_candidate(subgoal, class0, k)
-            return
-        elif literal.pred.id in db: # has a datalog definition, e.g. p(X), p[X]==Y
-            for clause in relevant_clauses(literal):
-                renamed = rename_clause(clause)
-                env = unify(literal, renamed.head)
-                if env != None:
-                    clause = subst_in_clause(renamed, env, class0)
-                    if Debug : print("pyDatalog will use clause : %s" % clause)
-                    schedule(Add_clause(subgoal, clause))
-            return
-        elif literal.pred.comparison: # p[X]<=Y => consider translating to (p[X]==Y1) & (Y1<Y)
-            literal1 = literal.equalized()
-            if literal1.pred.db: # equality has a datalog definition
-                Y1 = Fresh_var()
-                literal1.terms[-1] = Y1
-                literal2 = Literal('='+Y1.id, (Y1, terms[-1]))
-                literal2.pred.operator = literal.pred.comparison
-                add_expr_to_predicate(literal2.pred, literal.pred.comparison, literal0.pred.expression)
-                clause = Clause(literal, (literal1, literal2))
-                renamed = rename_clause(clause)
-                env = unify(literal, renamed.head)
-                if env != None:
-                    renamed = subst_in_clause(renamed, env, class0)
-                    if Debug : print("pyDatalog will use clause for comparison: %s" % renamed)
-                    schedule(Add_clause(subgoal, renamed))
-                return
-            
-    if class0: # a.p[X]==Y, a.p[X]<y, to access instance attributes
-        try: 
-            resolver = class0.pyDatalog_search
-            if not class0.has_SQLAlchemy : gc.collect() # to make sure pyDatalog.metaMixin.__refs__[cls] is correct
-            if Debug : print("pyDatalog uses pyDatalog_search for %s" % literal)
-            for result in resolver(literal):
-                fact_candidate(subgoal, class0, result)
-            return
-        except AttributeError:
-            pass
-    raise AttributeError("Predicate without definition (or error in resolver): %s" % literal.pred.id)
-            
-# Sets up and calls the subgoal search procedure, and then extracts
-# the answers into an easily used table.  The table has the name of
-# the predicate, the predicate's arity, and an array of constant
-# terms for each answer.  If there are no answers, nil is returned.
+        raise AttributeError("Predicate without definition (or error in resolver): %s" % literal.pred.id)
 
-def _(literal, fast):
-    global Fast, subgoals, tasks, Stack
-    Fast = fast
-    
-    subgoals = {}
-    subgoal = make_subgoal(literal)
-    merge(subgoal)
-    invoke(lambda subgoal=subgoal: search(subgoal))
-    subgoals = None
-    return [ tuple([term.id for term in literal.terms]) for literal in list(subgoal.facts.values())]    
-Literal.ask = _
 
-def toAnswer(literal, answers):
-    if answers:
-        transposed = list(zip(*(answers))) # transpose result
-        result = []
-        for i, arg in enumerate(literal.terms):
-            if not isinstance(arg, Var) or not arg.id.startswith('_pyD_'):
-                result.append(transposed[i])
-        answers = list(zip(*result)) if result else answers
-    if 0 < len(answers):
-        answer = pyDatalog.Answer(literal.pred.name, literal.pred.arity, answers)
-    else:
-        answer = None
-    if Auto_print: 
-        print(answers)
-    return answer
+    ################## add derived facts and use rules ##############
+
+    def add_clause(self, clause):
+        """ SLG_NEWCLAUSE in the reference article """
+        if self.is_done: # for speed
+            if Slow_motion: print("Already completed !")
+            return self.next_step() # no need to keep looking if THE answer is found already
+        if not clause.body:
+            self.fact(clause.head)
+        else:
+            self.rule(clause, clause.body[0])
+        return self.next_step()
     
-# PRIMITIVES
+    def fact(self, literal):
+        """ 
+        Store a derived fact, and inform all waiters of the fact too. 
+        SLG_ANSWER in the reference article
+        """
+        all_const = True # Cython equivalent for all(t.is_const() for t in literal.terms)
+        if not literal is True:
+            for t in literal.terms:
+                if not(isinstance(t, Const) or t.is_const()): # use isinstance for speed
+                    all_const = False
+                    break
+        if literal is True or not all_const:
+            if self.facts != True: # if already True, do not advise its waiters again
+                if Logging: logging.info("New fact : %s is True" % str(self.literal))
+                self.facts, self.is_done = True, True
+                for subgoal, clause in self.waiters:
+                    resolvent = Clause(clause.head, clause.body[1:])
+                    subgoal.schedule((ADD_CLAUSE, (subgoal, resolvent)))
+                self.waiters = []
+        elif self.facts is not True:
+            fact_id = literal.get_fact_id()
+            if not self.facts.get(fact_id):
+                if Logging: logging.info("New fact : %s" % str(literal))
+                self.facts[fact_id] = literal
+                for subgoal, clause in self.waiters:
+                    # Resolve the selected literal of a clause with a literal.
+                    # The selected literal is the first literal in body of a rule.
+                    # A new clause is generated that has a body with one less literal.
+                    env = clause.body[0].unify(literal)
+                    assert env != None
+                    resolvent = Clause(clause.head.subst(env), 
+                                       [bodi.subst(env) for bodi in clause.body[1:] ])
+                    subgoal.schedule((ADD_CLAUSE, (subgoal, resolvent)))
+                all_const = True # Cython equivalent for all(self.literal.terms[i].is_const() for i in range(self.literal.pred.prearity)
+                for i in range(self.literal.pred.prearity):
+                    t = self.literal.terms[i]
+                    if not(isinstance(t, Const) or t.is_const()): # use isinstance for speed
+                        all_const = False
+                        break
+                if len(self.facts)==1 and all_const:
+                    if Slow_motion: print("is done !")
+                    self.is_done = True # one fact for a function of constant
+                    self.waiters = []
+
+    def fact_candidate(self, class0, result):
+        """ add result as a candidate fact of class0 for subgoal"""
+        if result is True:
+            self.fact(True)
+            return
+        result = [Term_of(r) for r in result]
+        if len(result) != len(self.literal.terms):
+            return
+        if class0 and result[1].id and not isinstance(result[1].id, class0): #prefixed
+            return
+        result = Literal(self.literal.pred.name, result)
+        if self.literal.match(result) != None:
+            self.fact(result)
+
+    def rule(self, clause, selected):
+        """ Use a newly derived rule. SLG_POSITIVE in the reference article """
+        sg = Logic.tl.logic.Subgoals.get(selected.get_tag())
+        if sg != None: # selected subgoal exists already
+            if sg.facts is True:
+                resolvent = Clause(clause.head, clause.body[1:])
+                self.schedule((ADD_CLAUSE, (self, resolvent)))
+            else:
+                for fact in sg.facts.values(): # catch-up with facts already established
+                    env = clause.body[0].unify(fact)
+                    assert env != None
+                    resolvent = Clause(clause.head.subst(env), 
+                                       [bodi.subst(env) for bodi in clause.body[1:] ])
+                    self.schedule((ADD_CLAUSE, (self, resolvent)))
+            if sg.tasks and sg != self: # no need to say that I'm searching myself
+                self.schedule((SEARCHING, (self, sg )))
+            if not sg.is_done:
+                sg.waiters.append((self, clause)) # add me to sg's waiters
+        else: # new subgoal --> create it and launch it
+            sg = Subgoal(selected)
+            sg.waiters.append((self, clause))
+            self.schedule_search(sg)
+            
+
+    # state machine of the engine :
+    # A stack of thunks is used to avoid the stack overflow problem
+    # by delaying the evaluation of some functions
+    
+    def schedule(self, task):
+        """ Schedule a task for later invocation """
+        if Slow_motion: print("  Add : %s" % show(task))
+        if task[0] is SEARCH:
+            # not done in Subgoal.complete() for speed reason
+            if Slow_motion:
+                sg = Logic.tl.logic.Subgoals.get(self.literal.get_tag())
+                if sg != None: # selected subgoal exists already
+                    assert False
+                
+            Logic.tl.logic.Subgoals[self.literal.get_tag()] = self
+        if self.recursive:
+            Logic.tl.logic.Recursive_Tasks.appendleft(task)
+            self.tasks.appendleft(task)
+        else:
+            Logic.tl.logic.Tasks.append(task)
+            self.tasks.append(task)
+
+    def schedule_search(self, subgoal):
+        """ schedule SEARCH before SEARCHING, if possible """
+        Logic.tl.logic.Recursive = subgoal.recursive
+        if self.recursive:
+            if subgoal.recursive:
+                subgoal.schedule((SEARCH, (subgoal, ))) # first
+                self.schedule((SEARCHING, (self, subgoal ))) # last
+            else:
+                self.schedule((SEARCHING, (self, subgoal ))) # last
+                subgoal.schedule((SEARCH, (subgoal, ))) # first
+        else:
+            if subgoal.recursive:
+                self.schedule((SEARCHING, (self, subgoal ))) # first !
+                subgoal.schedule((SEARCH, (subgoal, ))) # last !
+            else:
+                self.schedule((SEARCHING, (self, subgoal ))) # last
+                subgoal.schedule((SEARCH, (subgoal, ))) # first
+            
+    def next_step(self):
+        """ returns the next step in the resolution """
+        Ts = Logic.tl.logic
+        # self.print_()
+        if Slow_motion:
+            if self.facts is not True:
+                print("Facts of:" + str(self))
+                for fact in self.facts:
+                    print("  " + str(fact))
+            print("Clauses of:" + str(self))
+            for task in self.clauses:
+                print("  " + show(task))
+            if self.on_completion_:
+                print("On completion : ")
+                for task in self.on_completion_:
+                    print("  " + show(task))
+            print("STACK :" + ("<---" if not Ts.Recursive else ""))
+            for task in reversed(Ts.Tasks):
+                print("  " + show(task))
+            print("RECURSIVE STACK :" + ("<---" if Ts.Recursive else ""))
+            for task in reversed(Ts.Recursive_Tasks):
+                print("  " + show(task))
+            print(" ")
+            
+        task = (None, None); tasks = None
+        if not Ts.Goal.is_done:
+            if Ts.Recursive:
+                if Ts.Recursive_Tasks:
+                    task = Ts.Recursive_Tasks.pop()
+                    tasks = task[1][0].tasks
+                elif Ts.Tasks:
+                    Ts.Recursive = False
+                    task = Ts.Tasks.pop()
+                    tasks = task[1][0].tasks
+            else:
+                if Ts.Tasks:
+                    task = Ts.Tasks.pop()
+                    tasks = task[1][0].tasks
+                elif Ts.Recursive_Tasks:
+                    Ts.Recursive = True
+                    task = Ts.Recursive_Tasks.pop()
+                    tasks = task[1][0].tasks
+            task2 = tasks.pop() if tasks else (None, None)
+            assert task == task2 # make sure we are in sync, and not lose tasks
+        if Slow_motion:
+            print("Processing : %s" % show(task))
+        return task
+
+    def next_clause(self):
+        task = None
+        if self.tasks: # still some tasks to do --> postpone next_clause
+            task = self.next_step()
+        elif self.clauses:
+            task = self.clauses.pop()
+        elif self.on_completion_:
+            task = self.on_completion_.pop()
+
+        if task:
+            self.schedule((NEXT_CLAUSE, (self,)))
+            return task
+        return self.next_step()
+                
+    def searching(self, subgoal):
+        """ task used to relaunch searching of subgoal"""
+        Ts = Logic.tl.logic
+        if not(subgoal.tasks) and not(subgoal.clauses): # subgoal is completed
+            if subgoal.on_completion_: # find the completion task for self
+                for pos, task in enumerate(subgoal.on_completion_):
+                    if task[1][1] == self:
+                        subgoal.on_completion_.pop(pos) # don't do it again
+                        return task
+            return self.next_step()
+        # restart searching of subgoal, in correct recursive mode
+        # unless the subgoal is a waiter of self (to prevent infinite loop)
+        if all(subgoal != waiter[0] for waiter in self.waiters):
+            task = (SEARCHING, (self, subgoal))
+            if task not in self.tasks:
+                self.schedule(task)
+            if subgoal.tasks: # place first subgoal task on top of stack, for immediate use
+                task = subgoal.tasks[-1]
+                if Slow_motion:
+                    print("Moving task forward : %s" % show(task))
+                if subgoal.recursive: # find the last occurence of task
+                    Ts.Recursive_Tasks.reverse()
+                    Ts.Recursive_Tasks.remove(task) #TODO this may raise an error ?
+                    Ts.Recursive_Tasks.reverse()
+                    Ts.Recursive_Tasks.append(task)
+                else:
+                    Ts.Tasks.remove(task) #TODO this may raise an error ?
+                    Ts.Tasks.append(task)
+            elif subgoal.clauses:
+                assert False #TODO needs a test case
+            Ts.Recursive = subgoal.recursive
+        return self.next_step()
+    
+    def complete(self, literal, aggregate=None):
+        """makes sure that subgoal is completed before calling post_thunk and resuming processing"""
+        #TODO check for infinite loops
+        # example : p(X) <= ~q(X); q(X) <= ~ p(X); creates an infinite loop
+        subgoal = Logic.tl.logic.Subgoals.get(literal.get_tag())
+        if subgoal == None: # selected subgoal does not exist yet
+            subgoal = Subgoal(literal)
+            self.schedule_search(subgoal)
+        else:
+            self.schedule((SEARCHING, (self, subgoal)))
+        subgoal.on_completion_.append( (ON_COMPLETION, (subgoal, self, aggregate)) )
+    
+    def on_completion(self, parent, aggregate):
+        if Logging: logging.debug('Processing aggregate or negation')
+
+        if aggregate:
+            aggregate.complete(self, parent)
+        else:
+            assert hasattr(parent.literal.pred, 'base_pred') # parent is a negation
+            if not self.facts:
+                parent.fact(True)
+        return self.next_step()
+            
+# op codes are defined after class Subgoal is defined
+SEARCHING = Subgoal.searching
+SEARCH = Subgoal.search
+ADD_CLAUSE = Subgoal.add_clause
+NEXT_CLAUSE = Subgoal.next_clause
+ON_COMPLETION = Subgoal.on_completion
+
+def show(task):
+    if task == (None, None):
+        return
+    result = {SEARCHING: "Searching", 
+              SEARCH: "Search", 
+              ADD_CLAUSE: "Add clause", 
+              NEXT_CLAUSE: "Next clause",
+              ON_COMPLETION: "On completion"}
+    result = "{:40s}.. : ".format(str(task[1][0])[:40]) + result[task[0]] + " " + str(task[1][1:])
+    return result if len(result)<110 else result[:110]
+
+# PRIMITIVES   ##################################################
 
 """
 
@@ -906,11 +1099,6 @@ sequence of answers, each answer being an array of strings or numbers.
 
 """
 
-# Other parts of the Datalog system depend on the equality primitive,
-# so carefully consider any modifications to it.
-
-binary_equals_pred = Pred("=", 2)
-
 def equals_primitive(literal, subgoal):
     x = literal.terms[0]
     y = literal.terms[1]
@@ -920,149 +1108,53 @@ def equals_primitive(literal, subgoal):
         y = y.subst(env)
     #unbound: can't raise error if both are still unbound, because split(a,b,c) would fail (see test.py)
     return x.equals_primitive(y, subgoal)
-binary_equals_pred.prim = equals_primitive
 
-# Does a literal unify with an fact known to contain only constant
-# terms?
-
-def match(literal, fact):
-    env = {}
-    for term, factterm in zip(literal.terms, fact.terms):
-        if term != factterm:
-            env = term.match(factterm, env)
-            if env == None: return env
-    return env
-Const.match = lambda self, const, env : None
-def _(self, const, env):
-    if self not in env:
-        env[self] = const
-        return env
-    elif env[self] == const: # dead code ?
-        return env
-    else: # dead code ?
-        return None
-Var.match = _
-Fresh_var.match = _
-
-# Add a primitives that is defined by an iterator.  When given a
-# literal, the iterator generates a sequences of answers.  Each
-# answer is an array.  Each element in the array is either a number
-# or a string.  The length of the array is equal to the arity of the
-# predicate.
-
-def add_iter_prim_to_predicate(pred, iter): # separate function to allow re-use
-    def prim(literal, subgoal, pred=pred, iter=iter): # TODO consider merging with fact_candidate
-        for terms in iter(literal):
-            if len(terms) == len(literal.terms):
-                new = Literal(pred, [Interned.of(term) for term in terms])
-                if match(literal, new) != None:
-                    fact(subgoal, new)
-    pred.prim = prim
-    
-# Support for expression
-
-# Expressions (such as X = Y-1) are represented by a predicate (P(X,Y)) with :
-#    an attached expression Y-1 (stored in pred.expression)
-#    an operator (=, <=, >=, !=) (stored in pred.operator)
-#    and an iterative function (stored in pred.prim)
-
-# An Operand is either a constant or an index in the list of arguments of a literal
-# e.g. in P(X,Y) for X = Y-1, Y has an index of 1
-
-class Operand(object):
-    def __init__(self, type, value):
-        self.value = value if type != 'variable' else None
-        self.index = value if type == 'variable' else None
-    def eval(self, environment):
-        if self.index != None:
-            return environment[self.index-1]
-        elif isinstance(self.value, (list, tuple)):
-            return tuple(element.eval(environment) for element in self.value)
-        elif isinstance(self.value, slice):
-            return slice(self.value.start.eval(environment), 
-                         self.value.stop.eval(environment),
-                         self.value.step.eval(environment),)
+def compare_primitive(literal, subgoal):
+    x = literal.terms[0]
+    y = literal.terms[1]
+    if not x.is_const():
+        if literal.pred.name == '_pyD_in':
+            if not y.is_const:
+                raise util.DatalogError("Error: right hand side must be bound: %s" % literal, None, None)
+            for v in y.id:
+                literal = Literal(literal.pred.name, [Term_of(v), y])
+                subgoal.fact(literal)
         else:
-            return self.value
-        
-class Expression(object):
-    def __init__(self, operator, operand1, operand2):
-        self.operator = operator
-        self.operand1 = operand1
-        self.operand2 = operand2
-    def eval(self, env):
-        if self.operator == '+':
-            return self.operand1.eval(env) + self.operand2.eval(env)
-        elif self.operator == '-':
-            return self.operand1.eval(env) - self.operand2.eval(env)
-        elif self.operator == '*':
-            return self.operand1.eval(env) * self.operand2.eval(env)
-        elif self.operator == '/':
-            return self.operand1.eval(env) / self.operand2.eval(env)
-        elif self.operator == '//':
-            return self.operand1.eval(env) // self.operand2.eval(env)
-        elif self.operator == 'slice':
-            return self.operand1.eval(env).__getitem__(self.operand2.eval(env))
-        assert False # dead code
-        
-"""
-lambda
-"""
-class Lambda(object):
-    def __init__(self, lambda_object, operands):
-        self.lambda_object = lambda_object
-        self.operands = operands
-    def eval(self, env):
-        operands = [operand.eval(env) for operand in self.operands]
-        return self.lambda_object(*operands)
-        
-def make_lambda(lambda_object, operands):
-    return Lambda(lambda_object, operands)
+            raise util.DatalogError("Error: left hand side of comparison must be bound: %s" 
+                                    % literal.pred.id, None, None)
+    elif y.is_const():
+        if compare(x.id, literal.pred.name, y.id):
+            subgoal.fact(True)
+    else:
+        raise util.DatalogError("Error: right hand side of comparison must be bound: %s" 
+                                % literal.pred.id, None, None)
 
 # generic comparison function
 def compare(l,op,r):
-    return l in r if op=='in' else l not in r if op=='not in' else l==r if op=='==' else l!=r if op=='!=' else l<r if op=='<' \
+    return l in r if op=='_pyD_in' else l not in r if op=='_pyD_not_in' else l==r if op=='==' else l!=r if op=='!=' else l<r if op=='<' \
         else l<=r if op=='<=' else l>=r if op=='>=' else l>r if op=='>' else None
 def compare2(l,op,r):
-    return l._in(r) if op=='in' else l._not_in(r) if op=='not in' else compare(l,op,r)
+    return l._in(r) if op=='_pyD_in' else l._not_in(r) if op=='_pyD_not_in' else compare(l,op,r)
 
-# this functions adds an expression to an existing predicate
-
-def add_expr_to_predicate(pred, operator, expression):
-    def expression_iter(literal):
-        x = literal.terms[0]
-        args = []
-        assert operator in ('==', 'in') or x.is_constant, "Error: left hand side of comparison must be bound: %s" % literal.pred.id
-        for term in literal.terms[1:]:
-            if not term.is_constant:
-                #unbound: can't raise error if right side is unbound, because split(a,b,c) would fail (see test.py)
-                assert operator == '==', "Error: right hand side of comparison must be unbound: %s" % literal.pred.id
-                return
-            args.append(term.id)
-            
-        Y = literal.pred.expression.eval(args) if literal.pred.expression else args[0]
-        if literal.pred.operator == "==" and (not x.is_constant or x.id == Y):
-            args.insert(0,Y)
-            yield args
-        elif x.is_constant and compare(x.id, literal.pred.operator, Y):
-            args.insert(0,x.id)
-            yield args
-        elif (literal.pred.operator == "in" and not x.is_constant):
-            for v in Y:
-                values = list(args) # makes a copy
-                values.insert(0,v)
-                yield values
-
-    add_iter_prim_to_predicate(pred, expression_iter)
-    pred.operator = operator
-    pred.expression = expression
-    insert(pred)
+# Initialization   ##################################################
 
 def clear():
-    global binary_equals_pred, db
-    db = {}
-    Pred.registry = weakref.WeakValueDictionary()
-    binary_equals_pred = Pred("=", 2)
-    binary_equals_pred.prim = equals_primitive
+    """ clears the logic """
+    Logic.tl.logic.Db = {}
+    Logic.tl.logic.Pred_registry = weakref.WeakValueDictionary()
+    Logic.tl.logic.Subgoals = {}
+    Logic.tl.logic.Tasks = None
+    Logic.tl.logic.Recursive_Tasks = None
+    Logic.tl.logic.Recursive = False
+    Logic.tl.logic.Goal = None
+    Logic.tl.logic.gc_uncollected = False
+    Fresh_var.tl.counter = 0
 
-clear()
+    insert(Pred("==", 2)).prim = equals_primitive
+    insert(Pred("<" , 2)).prim = compare_primitive
+    insert(Pred("<=", 2)).prim = compare_primitive
+    insert(Pred("!=", 2)).prim = compare_primitive
+    insert(Pred(">=", 2)).prim = compare_primitive
+    insert(Pred(">" , 2)).prim = compare_primitive
+    insert(Pred("_pyD_in", 2)).prim = compare_primitive
+    insert(Pred("_pyD_not_in", 2)).prim = compare_primitive

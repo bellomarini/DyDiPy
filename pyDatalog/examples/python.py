@@ -48,7 +48,7 @@ Sam = Employee('Sam', Mary, 5900)
 print(John.salary_class) # prints 6
 
 # who has a salary of 6300 ?
-X = pyDatalog.Variable()
+pyDatalog.create_terms('X')
 Employee.salary[X] == 6300 # notice the similarity to a pyDatalog query
 print(X) # prints [Mary]
 print(X.v()) # prints Mary
@@ -59,7 +59,7 @@ print(X) # prints [John]
 
 # Who are the employees of John with a salary below 6000 ?
 result = (Employee.salary[X] < 6000) & Employee.indirect_manager(X, John)
-print(result) # prints [(Sam,)]
+print(result) # Sam is in the result
 print(X) # prints [Sam]
 print((Employee.salary_class[X] == 5) & Employee.indirect_manager(X, John) >= X) # Sam
 

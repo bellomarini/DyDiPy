@@ -72,7 +72,7 @@ session.add(Sam)
 session.commit()
 
 """ 4. Query the objects using the datalog engine """
-pyDatalog.create_atoms('X, Y, N, lowest')
+pyDatalog.create_terms('X, Y, N, lowest')
 
 # the following python statements implicitly use the datalog clauses in the class definition
 
@@ -80,7 +80,6 @@ pyDatalog.create_atoms('X, Y, N, lowest')
 print(John.salary_class) # prints 6
 
 # who has a salary of 6300 ?
-X = pyDatalog.Variable()
 Employee.salary[X] == 6300 # notice the similarity to a pyDatalog query
 print(X) # prints [Employee: Mary]
 print(X.v()) # prints Employee:Mary
@@ -91,7 +90,7 @@ print(X) # prints [Employee: John]
 
 # Who are the employees of John with a salary below 6000 ?
 result = (Employee.salary[X] < 6000) & Employee.indirect_manager(X, John)
-print(result) # prints [(Employee: Sam,)]
+print(result) # Sam is in the result
 print(X) # prints [Employee: Sam]
 
 # verify that the manager of Mary is John
@@ -108,11 +107,11 @@ print(X) # prints [Employee: John]
 # what is the total salary of the employees of John ?
 # note : it is better to place aggregation clauses in the class definition 
 Mary.salary = 6400 # queries use the latest, in-session, data
-(Employee.budget[X] == _sum(N, for_each=Y)) <= (Employee.indirect_manager(Y, X)) & (Employee.salary[Y]==N)
+(Employee.budget[X] == sum_(N, for_each=Y)) <= (Employee.indirect_manager(Y, X)) & (Employee.salary[Y]==N)
 Employee.budget[John]==X
 print(X) # prints [12300]
 
 # who has the lowest salary ?
-(lowest[1] == _min(X, order_by=N)) <= (Employee.salary[X]==N)
+(lowest[1] == min_(X, order_by=N)) <= (Employee.salary[X]==N)
 # must use ask() because inline queries cannot use unprefixed literals 
-print(lowest[1]==X) # prints [(Employee: Sam,)]
+print(lowest[1]==X) # Sam is the result

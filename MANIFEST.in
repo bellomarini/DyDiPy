@@ -1,2 +1,4 @@
 include licence.txt
-include pyDatalog\examples\*.*
+include pyDatalog\*.c
+include pyDatalog\examples\*.py
+include pyDatalog\IPython\*.ipynb

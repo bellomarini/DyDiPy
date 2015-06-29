@@ -1,26 +1,34 @@
 
 from pyDatalog import pyDatalog
 import time
-from pyDatalog import pyEngine
 
-pyDatalog.create_atoms('N,N1, X,Y, X0,X1,X2')
-pyDatalog.create_atoms('ok,queens')
+pyDatalog.create_terms('N,N1, X,Y, X0,X1,X2,X3,X4,X5,X6,X7')
+pyDatalog.create_terms('ok,queens, next_queen, pred, pred2')
+
+size=8
 
 # when is it ok to have a queen in row X1 and another in row X2, separated by N columns
 # this is memoized !
-size=7
-ok(X1, N, X2) <= (X1._in(range(size))) & (X1!=X2) & (X1!= X2+N) & (X1!=X2-N)
-queens(1, X) <= (X1._in(range(size))) & (X==(X1,)) #TODO
-queens(N, X) <= (N>1) & (N1==N-1) & X0._in(range(size)) & queens(N1, Y) &  ok(Y[0], N1, X0) & queens(N1, Y[1:]+(X0,)) & (X==Y+(X0,))  
-print(queens(size, X))
+queens(N, X)    <= (N>1) & queens(N-1, X[:-1]) & next_queen(N, X)
+queens(1, X)    <= (X1._in(range(size))) & (X[0]==X1)
 
+next_queen(N, X) <= (N>2) & next_queen(N-1, X[1:]) & ok(X[0], N-1, X[-1]) 
+next_queen(2, X) <= queens(1,(X1,)) & ok(X[0], 1, X1) & (X[1] == X1)
 
-# counting is 0-based, so this is actually the 8-queens solution
-# there is a fixed penalty the first time around (JIT, ...), so let's measure performance the second time
+ok(X1, N, X2) <= (X1 != X2) & (X1 != X2+N) & (X1 != X2-N)
+
 start_time = time.time()
-datalog_count = len(queens(size, X).data)
-datalog_time = (time.time() - start_time)
+print(queens(size, (X0,X1,X2,X3,X4,X5,X6,X7)))
+print("First datalog run in %f seconds" % (time.time() - start_time))
 
+start = time.time()
+for i in range(20):
+    # there is a warm-up period for the JIT --> let's compute it again
+    start_time = time.time()
+    datalog_count = len(queens(size, (X0,X1,X2,X3,X4,X5,X6,X7)).data)
+    datalog_time = (time.time() - start_time)
+    print(datalog_time)
+print("Average : %s" % ((time.time() - start)/20))
 
 # pure python solution found on http://rosettacode.org/wiki/N-Queens#Python, for comparison purposes
 
