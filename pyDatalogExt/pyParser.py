@@ -472,6 +472,7 @@ class Literal(object):
         self.args = list(args) + [p[1] for p in t]
         self.prearity = len(self.args) if prearity is None else prearity
         self.pre_calculations = Body()
+        self.aggregate = aggregate
         
         self.todo = self
         
@@ -496,6 +497,7 @@ class Literal(object):
                 Thread_storage.variables.add(var) #call update the list of variables since the last clause
             
         tbl = [a._pyD_lua for a in self.terms]
+        self.tbl = tbl
         # now create the literal for the head of a clause
         self.lua = pyEngine.Literal(self.predicate_name, tbl, self.prearity, aggregate)
         # TODO check that l.pred.aggregate is empty
@@ -654,6 +656,9 @@ class Body(LazyListOfList):
         self.todo = self
         for variable in env.values():
             variable.todo = self
+            
+        # the JointLiterals for this body
+        self.lua = pyEngine.JointLiterals([pyEngine.Literal(l.predicate_name, l.tbl, l.prearity, l.aggregate) for l in self.literals])
 
     def _variables(self):
         return self.__variables
@@ -667,6 +672,22 @@ class Body(LazyListOfList):
         if True: # use False for debugging of parser
             return LazyListOfList.__unicode__(self)
         return ' & '.join(list(map (util.unicode_type, self.literals)))
+    
+    def __le__(self, body):
+        " body <= body creates a clause or comparison"
+        body = body.as_literal if isinstance(body, Call) else body #call
+        if body is None:
+            pyEngine.remove(self.lua.pred)
+        elif not isinstance(body, (Literal, Body)):
+                raise util.DatalogError("Invalid body for clause", None, None)
+        else:
+            newBody = Body()
+            for literal in body.literals:
+                if isinstance(literal, HeadLiteral):
+                    raise util.DatalogError("Aggregation cannot appear in the lhs of a clause", None, None)
+                newBody = newBody & literal
+            return add_clause(self, newBody)
+
 
     def literal(self):
         """ return a literal that can be queried to resolve the body """
@@ -704,11 +725,7 @@ class Body(LazyListOfList):
         return self._data
 
 def add_clause(head,body):
-    if isinstance(body, Body):
-        tbl = [a.lua for a in body.literals]
-    else: # body is a literal
-        tbl = [body.lua,]
-    clause = pyEngine.Clause(head.lua, tbl)
+    clause = pyEngine.Clause(head.lua, body.lua)
     result = pyEngine.assert_(clause)
     if not result: 
         raise util.DatalogError("Can't create clause", None, None)

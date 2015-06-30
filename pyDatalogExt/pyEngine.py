@@ -386,8 +386,34 @@ class Pred(Interned):
     def __str__(self): 
         return "%s()" % self.name
 
+class JointLiterals(object):
+	""" A list of literals with an identity based on the identity
+		of the components.
+	"""
+	def __init__(self, literals=None):
+		self.literals = literals
+		self.id = None
 
-class Literal(object):
+	def get_id(self): #id
+		""" The id's encoding ensures that two JointLiterals having the same """
+		""" literals are the same. """
+		if not self.id: # cached
+			if self.literals:
+				result = [self.literals[0].pred.id]
+				for l in self.literals[1:]:
+					for t in l.terms:
+						result.append(t.id)
+			self.id = tuple(result)
+		return self.id
+	
+	def unify(self, other):
+		return {}
+	
+	def __iter__(self):
+		""" To iterate over the contained literals """
+		return self.literals.__iter__()
+	
+class Literal(JointLiterals):
     """ A literal is a predicate and a sequence of terms, 
         the number of which must match the predicate's arity.
     """
@@ -405,10 +431,13 @@ class Literal(object):
         else:
             self.pred = pred
             # TODO assert self.pred.prearity == (prearity or len(terms)), "Error: Incorrect mix of predicates and functions : %s" % str(self)
+        
+        # JointLiterals
+        super(Literal, self).__init__(literals=[self])
     
     def _renamed(self, new_name):
         _id = '%s/%i' % (new_name, len(self.terms))
-        pred= Logic.tl.logic.Pred_registry.get(_id, new_name)
+        pred = Logic.tl.logic.Pred_registry.get(_id, new_name)
         return Literal(pred, list(self.terms), prearity=self.pred.prearity, aggregate=self.aggregate)
         
     def rebased(self, parent_class): 
@@ -518,7 +547,7 @@ class Literal(object):
 
 
 class Clause(object):
-    """ A clause asserts that its head is true if every literal in its body is
+    """ A clause asserts that every literal in its head (LHS) is true if every literal in its body (RHS) is
         true.  If there are no literals in the body, the clause is a fact
     """
     __slots__ = ['head', 'body', 'id']
@@ -528,12 +557,17 @@ class Clause(object):
         self.body = body
         self.id = None
     def __str__(self):  
-        return "%s <= %s" % (str(self.head), '&'.join(str(literal) for literal in self.body))
+        return "%s <= %s" % ('&'.join(str(literal) for literal in self.head), '&'.join(str(literal) for literal in self.body))
     def __repr__(self):  
-        return ("%s <= %s" % (str(self.head), '&'.join(str(literal) for literal in self.body)))[:50]
+        return ("%s <= %s" % ('&'.join(str(literal) for literal in self.head), '&'.join(str(literal) for literal in self.body)))[:50]
     def __neg__(self):
         """retract clause"""
         retract(self) 
+    
+    def get_first_head(self):
+    	if isinstance(self.head,list):
+    		return self.head[0]
+    	return self.head
 
     def get_id(self): #id
         """ The id's encoding ensures that two clauses are structurally equal
@@ -543,22 +577,22 @@ class Clause(object):
             if not self.body: #if it is a fact
                 self.id = (self.head.get_fact_id(),)
             else:
-                self.id = (self.head.get_id(),) + tuple(bodi.get_id() for bodi in self.body)
+                self.id = (self.head.get_id(),) + (self.body.get_id(),)
         return self.id
     
     def subst(self, env, parent_class=None):
         """ apply the env mapping and rebase to parent_class, if any """
         if not env and not parent_class: return self
         if not parent_class:
-            return Clause(self.head.subst(env),
+            return Clause([head.subst(env) for head in self.head],
                            [bodi.subst(env) for bodi in self.body])
-        return Clause(self.head.subst(env).rebased(parent_class),
+        return Clause([head.subst(env).rebased(parent_class) for head in self.head],
                         [bodi.subst(env).rebased(parent_class) for bodi in self.body])
     
     def rename(self):
         """ returns the clause with fresh variables """
         env = {}
-        return Clause(self.head.shuffle(env),
+        return Clause([head.shuffle(env) for head in self.head],
                            [bodi.shuffle(env) for bodi in self.body])
 
 
@@ -570,7 +604,7 @@ def add_class(cls, name):
     env = {Var(name).id: Const('_pyD_class')}
     for pred in Logic.tl.logic.Db.values():
         for clause in pred.db.values():
-            clause.head.subst_first(env)
+            clause.get_first_head().subst_first(env)
             for literal in clause.body:
                 literal.subst_first(env)
 
@@ -580,26 +614,45 @@ def add_class(cls, name):
 # The database stores predicates that contain clauses.  
 
 def insert(pred):
-    Logic.tl.logic.Db[pred.id] = pred
-    return pred
+	""" Store predicate or body """
+	# predicate containing clauses
+	Logic.tl.logic.Db[pred.id] = pred
+	# bodies containing clauses
+	Logic.tl.logic.FO_Db[pred.id] = pred
+	return pred
 
 def remove(pred):
     if pred.id in Logic.tl.logic.Pred_registry:
         del Logic.tl.logic.Pred_registry[pred.id]
     if pred.id in Logic.tl.logic.Db: 
         del Logic.tl.logic.Db[pred.id]
+    if pred.id in Logic.tl.logic.FO_Db:
+    	del Logic.tl.logic.FO_Db[pred.id]
     return pred
-    
+
+def assert_ext_(clause):
+	""" Adds an ExtClause to the database """
+	id_ = clause.get_id()
+	body1 = clause.body1
+	# TODO retract
+	body1.db[id_] = clause
+	if any(literal1.pred.id == literal2.pred.id for literal1 in clause.body1 for literal2 in clause.body2):
+		body1.recursive = True
+	body1.clauses[_id] = clause
+	insert(body1)
+	
+	return clause
+	
 def assert_(clause):
     """ Add a safe clause to the database """
-    pred = clause.head.pred
+    pred = clause.get_first_head().pred
 
-    if not pred.prim:                   # Ignore assertions for primitives.
+    if not pred.prim: # Ignore assertions for primitives.
         id_ = clause.get_id()
         retract(clause) # to ensure unicity of functions
         pred.db[id_] = clause
         if not clause.body: # if it is a fact, update indexes
-            for i, term in enumerate(clause.head.terms):
+            for i, term in enumerate(clause.get_first_head().terms):
                 clauses = pred.index[i].setdefault(term.id, set()) # create a set if needed
                 clauses.add(clause)
         else:
@@ -609,15 +662,16 @@ def assert_(clause):
         insert(pred)
     return clause
 
+
 def retract(clause):
     """ retract a clause from the database"""
-    pred = clause.head.pred
+    pred = clause.get_first_head().pred
     id_ = clause.get_id()
     
     if id_ in pred.db: 
         if not clause.body: # if it is a fact, update indexes
             clause = pred.db[id_] # make sure it is identical to the one in the index
-            for i, term in enumerate(clause.head.terms):
+            for i, term in enumerate(clause.get_first_head().terms):
                 pred.index[i][term.id].remove(clause)
                 # TODO del pred.index[i][term] if the set is empty
         else:
@@ -745,7 +799,7 @@ class Subgoal(object):
                 assert self.clauses == []
                 for clause in relevant_clauses(literal):
                     renamed = clause.rename()
-                    env = literal.unify(renamed.head)
+                    env = literal.unify(renamed.get_first_head())
                     if env != None:
                         clause = renamed.subst(env, class0)
                         if Logging : logging.debug("pyDatalog will use clause : %s" % clause)
@@ -761,7 +815,7 @@ class Subgoal(object):
                     literal2 = Literal(literal.pred.comparison, [Y1, terms[-1]])
                     clause = Clause(literal, [literal1, literal2])
                     renamed = clause.rename()
-                    env = literal.unify(renamed.head)
+                    env = literal.unify(renamed.get_first_head())
                     if env != None:
                         renamed = renamed.subst(env, class0)
                         if Logging : logging.debug("pyDatalog will use clause for comparison: %s" % renamed)
@@ -809,7 +863,7 @@ class Subgoal(object):
             if Slow_motion: print("Already completed !")
             return self.next_step() # no need to keep looking if THE answer is found already
         if not clause.body:
-            self.fact(clause.head)
+            self.fact(clause.get_first_head())
         else:
             self.rule(clause, clause.body[0])
         return self.next_step()
@@ -830,7 +884,7 @@ class Subgoal(object):
                 if Logging: logging.info("New fact : %s is True" % str(self.literal))
                 self.facts, self.is_done = True, True
                 for subgoal, clause in self.waiters:
-                    resolvent = Clause(clause.head, clause.body[1:])
+                    resolvent = Clause(clause.get_first_head(), clause.body[1:])
                     subgoal.schedule((ADD_CLAUSE, (subgoal, resolvent)))
                 self.waiters = []
         elif self.facts is not True:
@@ -844,7 +898,7 @@ class Subgoal(object):
                     # A new clause is generated that has a body with one less literal.
                     env = clause.body[0].unify(literal)
                     assert env != None
-                    resolvent = Clause(clause.head.subst(env), 
+                    resolvent = Clause(clause.get_first_head().subst(env), 
                                        [bodi.subst(env) for bodi in clause.body[1:] ])
                     subgoal.schedule((ADD_CLAUSE, (subgoal, resolvent)))
                 all_const = True # Cython equivalent for all(self.literal.terms[i].is_const() for i in range(self.literal.pred.prearity)
@@ -877,13 +931,13 @@ class Subgoal(object):
         sg = Logic.tl.logic.Subgoals.get(selected.get_tag())
         if sg != None: # selected subgoal exists already
             if sg.facts is True:
-                resolvent = Clause(clause.head, clause.body[1:])
+                resolvent = Clause(clause.get_first_head(), clause.body[1:])
                 self.schedule((ADD_CLAUSE, (self, resolvent)))
             else:
                 for fact in sg.facts.values(): # catch-up with facts already established
                     env = clause.body[0].unify(fact)
                     assert env != None
-                    resolvent = Clause(clause.head.subst(env), 
+                    resolvent = Clause(clause.get_first_head().subst(env), 
                                        [bodi.subst(env) for bodi in clause.body[1:] ])
                     self.schedule((ADD_CLAUSE, (self, resolvent)))
             if sg.tasks and sg != self: # no need to say that I'm searching myself
@@ -1142,6 +1196,7 @@ def clear():
     """ clears the logic """
     Logic.tl.logic.Db = {}
     Logic.tl.logic.Pred_registry = weakref.WeakValueDictionary()
+    Logic.tl.logic.FO_Db = weakref.WeakValueDictionary() # for body-to-body clauses
     Logic.tl.logic.Subgoals = {}
     Logic.tl.logic.Tasks = None
     Logic.tl.logic.Recursive_Tasks = None
