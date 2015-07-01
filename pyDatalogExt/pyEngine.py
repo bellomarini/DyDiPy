@@ -408,7 +408,7 @@ class JointLiterals(object):
 	
 	def unify(self, other):
 		return {}
-	
+		
 	def __iter__(self):
 		""" To iterate over the contained literals """
 		return self.literals.__iter__()
@@ -629,57 +629,48 @@ def remove(pred):
     if pred.id in Logic.tl.logic.FO_Db:
     	del Logic.tl.logic.FO_Db[pred.id]
     return pred
-
-def assert_ext_(clause):
-	""" Adds an ExtClause to the database """
-	id_ = clause.get_id()
-	body1 = clause.body1
-	# TODO retract
-	body1.db[id_] = clause
-	if any(literal1.pred.id == literal2.pred.id for literal1 in clause.body1 for literal2 in clause.body2):
-		body1.recursive = True
-	body1.clauses[_id] = clause
-	insert(body1)
-	
-	return clause
 	
 def assert_(clause):
     """ Add a safe clause to the database """
-    pred = clause.get_first_head().pred
-
-    if not pred.prim: # Ignore assertions for primitives.
-        id_ = clause.get_id()
-        retract(clause) # to ensure unicity of functions
-        pred.db[id_] = clause
-        if not clause.body: # if it is a fact, update indexes
-            for i, term in enumerate(clause.get_first_head().terms):
-                clauses = pred.index[i].setdefault(term.id, set()) # create a set if needed
-                clauses.add(clause)
-        else:
-            if any(literal.pred.id == pred.id for literal in clause.body):
-                pred.recursive = True
-            pred.clauses[id_] = clause
-        insert(pred)
+    
+    # for each literal in the head
+    for head in clause.head:
+    	# extracts the predicate
+    	pred = head.pred
+	
+    	if not pred.prim: # Ignore assertions for primitives.
+        	id_ = clause.get_id()
+        	retract(clause) # to ensure unicity of functions
+        	pred.db[id_] = clause
+        	if not clause.body: # if it is a fact, update indexes
+            		for i, term in enumerate(clause.get_first_head().terms):
+                		clauses = pred.index[i].setdefault(term.id, set()) # create a set if needed
+                		clauses.add(clause)
+        	else:
+            		if any(literal.pred.id == pred.id for literal in clause.body):
+                		pred.recursive = True
+            		pred.clauses[id_] = clause
+        	insert(pred)
     return clause
 
 
 def retract(clause):
     """ retract a clause from the database"""
-    pred = clause.get_first_head().pred
-    id_ = clause.get_id()
-    
-    if id_ in pred.db: 
-        if not clause.body: # if it is a fact, update indexes
-            clause = pred.db[id_] # make sure it is identical to the one in the index
-            for i, term in enumerate(clause.get_first_head().terms):
-                pred.index[i][term.id].remove(clause)
-                # TODO del pred.index[i][term] if the set is empty
-        else:
-            del pred.clauses[id_]
-        del pred.db[id_]  # remove clause from pred.db
-    # delete it completely if it's a temporary query predicate
-    if pred.name.startswith('_pyD_query') and len(pred.db) == 0 and pred.prim == None:
-        remove(pred)
+    for head in clause.head:
+        pred = head.pred
+        id_ = clause.get_id()
+        if id_ in pred.db: 
+            if not clause.body: # if it is a fact, update indexes
+                clause = pred.db[id_] # make sure it is identical to the one in the index
+                for i, term in enumerate(clause.get_first_head().terms):
+                    pred.index[i][term.id].remove(clause)
+                    # TODO del pred.index[i][term] if the set is empty
+            else:
+                del pred.clauses[id_]
+            del pred.db[id_]  # remove clause from pred.db
+        # delete it completely if it's a temporary query predicate
+        if pred.name.startswith('_pyD_query') and len(pred.db) == 0 and pred.prim == None:
+            remove(pred)
     return clause
     
 def relevant_clauses(literal):
