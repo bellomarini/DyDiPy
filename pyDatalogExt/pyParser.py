@@ -1,6 +1,7 @@
 """
-pyDatalog
+pyParser
 
+Copyright (C) 2015 Luigi Bellomarini
 Copyright (C) 2012 Pierre Carbonnelle
 Copyright (C) 2004 Shai Berger
 
@@ -65,6 +66,7 @@ PY3 = sys.version_info[0] == 3
 func_code = '__code__' if PY3 else 'func_code'
 
 from . import pyEngine
+from . import pyMappingEngine
 from . import util
 from . import UserList
 
@@ -584,14 +586,14 @@ class Query(Literal, LazyListOfList):
         " unary + means insert into database as fact "
         if self._variables():
             raise util.DatalogError("Cannot assert a fact containing Variables", None, None)
-        clause = pyEngine.Clause(self.lua, [])
+        clause = pyEngine.Clause(self.lua, pyEngine.JointLiterals([]),self)
         pyEngine.assert_(clause)
 
     def __neg__(self):
         " unary - means retract fact from database "
         if self._variables():
             raise util.DatalogError("Cannot retract a fact containing Variables", None, None)
-        clause = pyEngine.Clause(self.lua, [])
+        clause = pyEngine.Clause(self.lua, pyEngine.JointLiterals([]),self)
         pyEngine.retract(clause)
         
     def __invert__(self):
@@ -725,7 +727,7 @@ class Body(LazyListOfList):
         return self._data
 
 def add_clause(head,body):
-    clause = pyEngine.Clause(head.lua, body.lua)
+    clause = pyEngine.Clause(head.lua, body.lua, head, body)
     result = pyEngine.assert_(clause)
     if not result: 
         raise util.DatalogError("Can't create clause", None, None)
@@ -851,6 +853,10 @@ def ask(code):
     a = parsed_code.ask()
     return Answer.make(a)
 
+def chase():
+    """ Chase all the asserted clauses """
+    pyMappingEngine.chase()
+               
 class Answer(object):
     """ object returned by ask() """
     def __init__(self, name, arity, answers):

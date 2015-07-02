@@ -110,6 +110,10 @@ def ask(code):
     """returns the result of the query contained in the code string"""
     return pyParser.ask(code)
 
+def chase():
+    """Performs the chase of all the asserted clauses"""
+    return pyParser.chase()
+
 def clear():
     """ resets the default datalog database """
     pyParser.clear()
@@ -247,7 +251,8 @@ class metaMixin(type):
         if cls in ('Mixin', 'metaMixin') or method in (
                 '__mapper_cls__', '_decl_class_registry', '__sa_instrumentation_manager__', 
                 '_sa_instance_state', '_sa_decl_prepare', '__table_cls__', '_pyD_query'):
-            raise AttributeError        return pyParser.Term("%s.%s" % (cls.__name__, method))
+            raise AttributeError
+        return pyParser.Term("%s.%s" % (cls.__name__, method))
 
     def pyDatalog_search(cls, literal):
         """Called by pyEngine to resolve a prefixed literal for a subclass of Mixin."""

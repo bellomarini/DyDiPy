@@ -731,7 +731,7 @@ def test():
                 print(e_message) 
             _error = True
         assert _error
-
+        
     assert_error('ask(z(a),True)', 'Too many arguments for ask \!')
     assert_error('ask(z(a))', 'Predicate without definition \(or error in resolver\): z/1')
     assert_error("+ farmer(farmer(moshe))", "Syntax error: Literals cannot have a literal as argument : farmer\[\]")
